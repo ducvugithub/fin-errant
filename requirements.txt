@@ -1,0 +1,2 @@
+stanza>=1.7.0
+python-Levenshtein>=0.21.0
