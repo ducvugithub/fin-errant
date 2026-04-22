@@ -76,12 +76,18 @@ class Edit:
     hyp_tokens: tuple        # Hypothesis tokens (empty for DEL)
     src_interval: tuple      # (start, end) span in source token list
     hyp_interval: tuple      # (start, end) span in hypothesis token list
-    error_type: str          # VERB:FORM, NOUN:CASE, SPELL, ...
+    error_types: tuple       # Tuple of error types, e.g. ("VOWEL:HARMONY", "CASE")
+
+    @property
+    def error_type(self) -> str:
+        """Primary (first) error type — for backwards compatibility."""
+        return self.error_types[0] if self.error_types else ErrorType.OTHER
 
     def __repr__(self):
         src = " ".join(t.text for t in self.src_tokens) or "∅"
         hyp = " ".join(t.text for t in self.hyp_tokens) or "∅"
-        return f"Edit({self.op} '{src}'→'{hyp}' [{self.error_type}] src={self.src_interval})"
+        types = "+".join(self.error_types)
+        return f"Edit({self.op} '{src}'→'{hyp}' [{types}] src={self.src_interval})"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +265,7 @@ class FinnishERRANT:
                             hyp_tokens=(hyp[j - 1],),
                             src_interval=(i - 1, i),
                             hyp_interval=(j - 1, j),
-                            error_type="",
+                            error_types=(),
                         ))
                     i -= 1
                     j -= 1
@@ -272,7 +278,7 @@ class FinnishERRANT:
                     hyp_tokens=(),
                     src_interval=(i - 1, i),
                     hyp_interval=(j, j),
-                    error_type="",
+                    error_types=(),
                 ))
                 i -= 1
             else:
@@ -282,7 +288,7 @@ class FinnishERRANT:
                     hyp_tokens=(hyp[j - 1],),
                     src_interval=(i, i),
                     hyp_interval=(j - 1, j),
-                    error_type="",
+                    error_types=(),
                 ))
                 j -= 1
 
@@ -293,81 +299,84 @@ class FinnishERRANT:
     # ------------------------------------------------------------------
 
     def classify(self, edit: Edit) -> Edit:
-        """Assign a Finnish-specific error type to an edit."""
+        """Assign Finnish-specific error types to an edit (may return multiple for SUB edits)."""
         return Edit(
             op=edit.op,
             src_tokens=edit.src_tokens,
             hyp_tokens=edit.hyp_tokens,
             src_interval=edit.src_interval,
             hyp_interval=edit.hyp_interval,
-            error_type=self._classify(edit),
+            error_types=tuple(self._classify(edit)),
         )
 
-    def _classify(self, edit: Edit) -> str:
+    def _classify(self, edit: Edit) -> list[str]:
+        # INS / DEL / PUNCT always go alone — no co-occurring types possible
         if edit.op == "INS":
-            return ErrorType.INSERT
+            return [ErrorType.INSERT]
         if edit.op == "DEL":
-            return ErrorType.DELETE
+            return [ErrorType.DELETE]
 
         src_tok = edit.src_tokens[0]
         hyp_tok = edit.hyp_tokens[0]
 
         if src_tok.upos == "PUNCT" or hyp_tok.upos == "PUNCT":
-            return ErrorType.PUNCT
+            return [ErrorType.PUNCT]
 
-        # Vowel harmony: check first before any morphological analysis
-        # (same-lemma tokens like talossa→talossä still enter same-lemma branch otherwise)
+        # SUB edits: collect all matching types (a single word change can be
+        # e.g. both VOWEL:HARMONY and CASE at the same time)
+        types = []
+
+        # Surface check: vowel harmony is independent of morphological features
         if _is_vowel_harmony_error(src_tok.text, hyp_tok.text):
-            return ErrorType.VOWEL_HARM
+            types.append(ErrorType.VOWEL_HARM)
 
         if src_tok.lemma == hyp_tok.lemma:
-            # VerbForm before all others (Inf/Fin/Part distinction)
+            # Morphological feature checks — collect all that differ
             if _fd(src_tok, hyp_tok, "VerbForm"):
-                return ErrorType.VERB_PART
-            # PartForm: present↔past participle (lukeva→lukenut, luettava→luettu)
+                types.append(ErrorType.VERB_PART)
             if _fd(src_tok, hyp_tok, "PartForm"):
-                return ErrorType.VERB_TENSE
-            # Order matters: Voice before Mood before Tense
+                types.append(ErrorType.VERB_TENSE)
             if _fd(src_tok, hyp_tok, "Voice"):
-                return ErrorType.VERB_VOICE
+                types.append(ErrorType.VERB_VOICE)
             if _fd(src_tok, hyp_tok, "Mood"):
-                return ErrorType.VERB_MOOD
+                types.append(ErrorType.VERB_MOOD)
             if _fd(src_tok, hyp_tok, "Tense"):
-                return ErrorType.VERB_TENSE
+                types.append(ErrorType.VERB_TENSE)
             if _fd(src_tok, hyp_tok, "Person"):
-                return ErrorType.PERSON
-            # Degree: comparative/superlative also appears on nouns
+                types.append(ErrorType.PERSON)
             if _fd(src_tok, hyp_tok, "Degree"):
-                return ErrorType.DEGREE
+                types.append(ErrorType.DEGREE)
             if _fd(src_tok, hyp_tok, "Case"):
-                return ErrorType.CASE
+                types.append(ErrorType.CASE)
             if _fd(src_tok, hyp_tok, "Number"):
-                return ErrorType.NUMBER
+                types.append(ErrorType.NUMBER)
             if _fd(src_tok, hyp_tok, "PossNumber") or _fd(src_tok, hyp_tok, "PersPoss"):
-                return ErrorType.NOUN_POSS
-            # Clitic: one token may have no Clitic feature at all, so no null guard
+                types.append(ErrorType.NOUN_POSS)
             clitic_s, clitic_h = src_tok.feat("Clitic"), hyp_tok.feat("Clitic")
             if clitic_s != clitic_h and (clitic_s is not None or clitic_h is not None):
-                return ErrorType.CLITIC
-            return ErrorType.VERB_FORM
+                types.append(ErrorType.CLITIC)
+            if not types:
+                types.append(ErrorType.VERB_FORM)
 
-        if src_tok.upos == hyp_tok.upos:
-            # Compound before generic WORD:CHOICE (talliin→autotalliin)
+        elif src_tok.upos == hyp_tok.upos:
             if _is_compound_variant(src_tok.text, hyp_tok.text):
-                return ErrorType.COMPOUND
-            if src_tok.upos in ("CCONJ", "SCONJ"):
-                return ErrorType.CONJ
-            if src_tok.upos == "PART":
-                return ErrorType.PART
-            return ErrorType.WORD_CHOICE
+                types.append(ErrorType.COMPOUND)
+            elif src_tok.upos in ("CCONJ", "SCONJ"):
+                types.append(ErrorType.CONJ)
+            elif src_tok.upos == "PART":
+                types.append(ErrorType.PART)
+            else:
+                types.append(ErrorType.WORD_CHOICE)
 
-        if _is_compound_variant(src_tok.text, hyp_tok.text):
-            return ErrorType.COMPOUND
+        else:
+            if _is_compound_variant(src_tok.text, hyp_tok.text):
+                types.append(ErrorType.COMPOUND)
+            elif _is_spelling_variant(src_tok.text, hyp_tok.text):
+                types.append(ErrorType.SPELL)
+            else:
+                types.append(ErrorType.OTHER)
 
-        if _is_spelling_variant(src_tok.text, hyp_tok.text):
-            return ErrorType.SPELL
-
-        return ErrorType.OTHER
+        return types or [ErrorType.OTHER]
 
     # ------------------------------------------------------------------
     # 4. Full pipeline
@@ -412,7 +421,7 @@ class FinnishERRANT:
 
             fp_edits    = [sys_keys[k]  for k in sys_keys  if k not in gold_keys]
             fn_edits    = [gold_keys[k] for k in gold_keys if k not in sys_keys]
-            other_edits = [e for e in fp_edits if e.error_type == ErrorType.OTHER]
+            other_edits = [e for e in fp_edits if ErrorType.OTHER in e.error_types]
 
             if fp_edits and len(fp_samples) < n:
                 fp_samples.append({
@@ -473,8 +482,8 @@ class FinnishERRANT:
             gold_edits_list = self.annotate(src, ref)
             sys_edits       = set(_edit_key(e) for e in sys_edits_list)
             gold_edits      = set(_edit_key(e) for e in gold_edits_list)
-            sys_type        = {_edit_key(e): e.error_type for e in sys_edits_list}
-            gold_type       = {_edit_key(e): e.error_type for e in gold_edits_list}
+            sys_types  = {_edit_key(e): e.error_types for e in sys_edits_list}
+            gold_types = {_edit_key(e): e.error_types for e in gold_edits_list}
 
             tp_keys = sys_edits & gold_edits
             fp_keys = sys_edits - gold_edits
@@ -485,11 +494,14 @@ class FinnishERRANT:
             total_fn += len(fn_keys)
 
             for key in tp_keys:
-                type_counts[gold_type.get(key, ErrorType.OTHER)]["tp"] += 1
+                for t in gold_types.get(key, (ErrorType.OTHER,)):
+                    type_counts[t]["tp"] += 1
             for key in fp_keys:
-                type_counts[sys_type.get(key, ErrorType.OTHER)]["fp"] += 1
+                for t in sys_types.get(key, (ErrorType.OTHER,)):
+                    type_counts[t]["fp"] += 1
             for key in fn_keys:
-                type_counts[gold_type.get(key, ErrorType.OTHER)]["fn"] += 1
+                for t in gold_types.get(key, (ErrorType.OTHER,)):
+                    type_counts[t]["fn"] += 1
 
             if verbose:
                 print(f"\nsrc:  {src}\npred: {pred}\nref:  {ref}")
@@ -498,7 +510,8 @@ class FinnishERRANT:
             if return_per_sample:
                 fp_by_type: dict[str, int] = defaultdict(int)
                 for key in fp_keys:
-                    fp_by_type[sys_type.get(key, ErrorType.OTHER)] += 1
+                    for t in sys_types.get(key, (ErrorType.OTHER,)):
+                        fp_by_type[t] += 1
                 per_sample.append({
                     "tp": len(tp_keys),
                     "fp": len(fp_keys),
