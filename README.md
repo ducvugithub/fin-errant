@@ -63,6 +63,9 @@ python evaluate.py --predictions model_a.jsonl model_b.jsonl --report-dir report
 --samples 20       # save 20 FP/FN examples instead of 10
 --max-examples 500 # evaluate only first 500 examples (quick check)
 --gpu              # use GPU for faster parsing
+--batch            # default True, prewarm the parse cache with one batched Stanza call;
+                   # change it to --no-batch if gpu isn't available or for debugging (much slower)
+--batch-size       # default 0, process all sentences at once; set to e.g. 64 for large datasets to save memory
 ```
 
 ---
