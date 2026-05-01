@@ -111,14 +111,23 @@ def print_results(results: dict):
     print("=" * 60 + "\n")
 
 
-def evaluate_one(errant, predictions_path: Path, report_dir: Path, max_examples, samples_n, verbose):
+def evaluate_one(errant, predictions_path: Path, report_dir: Path, max_examples, samples_n, verbose,
+                 batch: bool = True, batch_size: int = 0):
     print(f"\n[Info] Loading predictions from {predictions_path}")
     sources, predictions, references = load_predictions(predictions_path)
     if max_examples:
         sources, predictions, references = sources[:max_examples], predictions[:max_examples], references[:max_examples]
     print(f"[Info] Loaded {len(predictions):,} examples")
 
-    results = errant.score(sources, predictions, references, verbose=verbose, return_per_sample=True)
+    collect_n = samples_n if report_dir else 0
+    results = errant.score(
+        sources, predictions, references,
+        verbose=verbose,
+        return_per_sample=True,
+        collect_samples=collect_n,
+        batch=batch,
+        batch_size=batch_size,
+    )
     results['num_examples'] = len(predictions)
 
     zero_idx = [i for i, (s, r) in enumerate(zip(sources, references)) if s == r]
@@ -138,6 +147,7 @@ def evaluate_one(errant, predictions_path: Path, report_dir: Path, max_examples,
             'fp_by_type': dict(zero_fp_by_type),
         }
 
+    samples = results.pop('samples', {'fp': [], 'fn': [], 'other': []})
     results.pop('per_sample', None)
     print_results(results)
 
@@ -152,11 +162,9 @@ def evaluate_one(errant, predictions_path: Path, report_dir: Path, max_examples,
             f.write(format_report(results, predictions_path))
         print(f"[Info] Report saved to {report_dir / 'report.md'}")
 
-        print(f"[Info] Collecting {samples_n} FP/FN samples...")
-        samples = errant.error_samples(sources, predictions, references, n=samples_n)
         for key, path in [('fp', f"{samples_n}_fp.json"), ('fn', f"{samples_n}_fn.json"), ('other', f"{samples_n}_other.json")]:
             with open(report_dir / path, 'w', encoding='utf-8') as f:
-                json.dump(samples[key], f, indent=2, ensure_ascii=False)
+                json.dump(samples.get(key, []), f, indent=2, ensure_ascii=False)
         print(f"[Info] FP/FN/OTHER samples saved to {report_dir}/")
 
 
@@ -174,6 +182,13 @@ def main():
                         help='Number of FP/FN example samples to save (default: 10)')
     parser.add_argument('--gpu', action='store_true',
                         help='Use GPU for stanza parsing (faster)')
+    parser.add_argument('--batch', action=argparse.BooleanOptionalAction, default=True,
+                        help='Prewarm the parse cache with one batched Stanza call '
+                             '(default: True). Use --no-batch to parse one sentence '
+                             'at a time (much slower; for debugging only).')
+    parser.add_argument('--batch-size', type=int, default=0,
+                        help='Chunk size for batched Stanza calls. '
+                             '0 = single call for all inputs (default).')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -190,7 +205,10 @@ def main():
             report_dir = args.report_dir
         else:
             report_dir = (args.report_dir / pred_path.stem) if args.report_dir else None
-        evaluate_one(errant, pred_path, report_dir, args.max_examples, args.samples, args.verbose)
+        evaluate_one(
+            errant, pred_path, report_dir, args.max_examples, args.samples, args.verbose,
+            batch=args.batch, batch_size=args.batch_size,
+        )
 
 
 if __name__ == '__main__':

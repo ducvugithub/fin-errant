@@ -46,6 +46,17 @@ except ImportError:
     def tqdm(it, **kwargs):  # fallback: no-op
         return it
 
+try:
+    import Levenshtein as _Levenshtein  # type: ignore
+except ImportError:
+    _Levenshtein = None
+
+_HARMONY_PAIRS = frozenset({
+    ("a", "ä"), ("ä", "a"),
+    ("o", "ö"), ("ö", "o"),
+    ("u", "y"), ("y", "u"),
+})
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -154,8 +165,21 @@ class FinnishERRANT:
     def __init__(self, use_gpu: bool = False, lazy_load: bool = True):
         self._nlp = None
         self._use_gpu = use_gpu
+        self._parse_cache: dict[str, list[Token]] = {}
         if not lazy_load:
             self._load_stanza()
+
+    def _build_pipeline(self):
+        import stanza
+        return stanza.Pipeline(
+            lang="fi",
+            processors="tokenize,pos,lemma",
+            use_gpu=self._use_gpu,
+            tokenize_batch_size=128,
+            pos_batch_size=3000,
+            lemma_batch_size=200,
+            verbose=False,
+        )
 
     def _load_stanza(self):
         try:
@@ -165,36 +189,26 @@ class FinnishERRANT:
             sys.exit(1)
 
         try:
-            self._nlp = stanza.Pipeline(
-                lang="fi",
-                processors="tokenize,pos,lemma",
-                use_gpu=self._use_gpu,
-                verbose=False,
-            )
+            self._nlp = self._build_pipeline()
         except Exception:
             print("Finnish stanza model not found. Downloading...")
-            import stanza
             stanza.download("fi", verbose=False)
-            self._nlp = stanza.Pipeline(
-                lang="fi",
-                processors="tokenize,pos,lemma",
-                use_gpu=self._use_gpu,
-                verbose=False,
-            )
+            self._nlp = self._build_pipeline()
 
-        print("✓ stanza Finnish pipeline loaded")
+        try:
+            import torch
+            cuda_ok = torch.cuda.is_available()
+        except Exception:
+            cuda_ok = False
+        print(f"✓ stanza Finnish pipeline loaded (use_gpu={self._use_gpu}, cuda_available={cuda_ok})")
 
     # ------------------------------------------------------------------
     # 1. Parse
     # ------------------------------------------------------------------
 
-    def parse(self, text: str) -> list[Token]:
-        """Parse Finnish text into a list of Tokens with POS, lemma, and feats."""
-        if self._nlp is None:
-            self._load_stanza()
-
-        doc = self._nlp(text)
-        tokens = []
+    @staticmethod
+    def _doc_to_tokens(doc) -> list[Token]:
+        tokens: list[Token] = []
         idx = 0
         for sentence in doc.sentences:
             for word in sentence.words:
@@ -208,6 +222,51 @@ class FinnishERRANT:
                 ))
                 idx += 1
         return tokens
+
+    def _parse_many(self, texts, batch_size: int = 0) -> None:
+        """
+        Batch-parse a collection of texts and populate the parse cache. Texts
+        already cached are skipped. Empty strings are cached as empty token
+        lists without invoking Stanza.
+
+        Args:
+            batch_size: If > 0, chunk Stanza calls into groups of this size
+                        (useful to limit peak memory). If 0, send everything
+                        in one call (fastest, but uses more memory).
+        """
+        unique: list[str] = []
+        seen: set[str] = set()
+        for t in texts:
+            if t in self._parse_cache or t in seen:
+                continue
+            if not t:
+                self._parse_cache[t] = []
+                continue
+            seen.add(t)
+            unique.append(t)
+
+        if not unique:
+            return
+
+        if self._nlp is None:
+            self._load_stanza()
+
+        from stanza import Document
+        chunk = batch_size if batch_size and batch_size > 0 else len(unique)
+        for start in range(0, len(unique), chunk):
+            batch_texts = unique[start:start + chunk]
+            in_docs = [Document([], text=t) for t in batch_texts]
+            out_docs = self._nlp(in_docs)
+            for text, doc in zip(batch_texts, out_docs):
+                self._parse_cache[text] = self._doc_to_tokens(doc)
+
+    def parse(self, text: str) -> list[Token]:
+        """Parse Finnish text into a list of Tokens with POS, lemma, and feats."""
+        cached = self._parse_cache.get(text)
+        if cached is not None:
+            return cached
+        self._parse_many([text])
+        return self._parse_cache.get(text, [])
 
     # ------------------------------------------------------------------
     # 2. Align
@@ -398,9 +457,20 @@ class FinnishERRANT:
         predictions: list[str],
         references: list[str],
         n: int = 10,
+        batch: bool = True,
+        batch_size: int = 0,
     ) -> dict:
         """
         Collect example FP, FN, and OTHER-type samples for error analysis.
+
+        Args:
+            batch:      If True, prewarm the parse cache with one batched
+                        Stanza call over all unique inputs (fast).
+                        If False, parse on demand one sentence at a time
+                        (slow; only useful for debugging or very memory-
+                        constrained environments).
+            batch_size: When batch=True, chunk Stanza calls into groups of
+                        this size. 0 = single call for all inputs.
 
         Returns:
             {
@@ -409,6 +479,12 @@ class FinnishERRANT:
                 'other': [ {'corrupted', 'prediction', 'reference', 'other_edits'}, ... ],
             }
         """
+        if batch:
+            # Batch-parse every unique input string upfront so subsequent
+            # annotate() calls become cache lookups + alignment.
+            self._parse_many(list(sources) + list(predictions) + list(references),
+                             batch_size=batch_size)
+
         fp_samples, fn_samples, other_samples = [], [], []
 
         for src, pred, ref in tqdm(zip(sources, predictions, references),
@@ -456,6 +532,9 @@ class FinnishERRANT:
         references: list[str],
         verbose: bool = False,
         return_per_sample: bool = False,
+        collect_samples: int = 0,
+        batch: bool = True,
+        batch_size: int = 0,
     ) -> dict:
         """
         Compute F0.5, precision, recall — overall and per error type.
@@ -464,26 +543,57 @@ class FinnishERRANT:
             sources:     Original corrupted sentences
             predictions: Model predictions
             references:  Gold corrections
+            collect_samples: If > 0, also gather up to N FP / FN / OTHER example
+                             dicts during the same pass (replaces a second
+                             traversal via error_samples()).
+            batch:       If True, prewarm the parse cache with one batched
+                         Stanza call over all unique inputs (fast — recommended).
+                         If False, parse on demand one sentence at a time
+                         (slow; useful for debugging or memory-constrained
+                         environments).
+            batch_size:  When batch=True, chunk Stanza calls into groups of
+                         this size. 0 = single call for all inputs.
 
         Returns:
             {
                 'precision': float, 'recall': float, 'f05': float,
                 'tp': int, 'fp': int, 'fn': int,
-                'by_type': {error_type: {'precision', 'recall', 'f05', 'tp', 'fp', 'fn'}}
+                'by_type': {error_type: {'precision', 'recall', 'f05', 'tp', 'fp', 'fn'}},
+                # optional:
+                'per_sample': [...],
+                'samples': {'fp': [...], 'fn': [...], 'other': [...]},
             }
         """
+        if batch:
+            # Batch-parse every unique input string in ONE Stanza call. After
+            # this, annotate()/parse() become pure cache lookups + alignment +
+            # classification in Python, which are negligible compared to the
+            # Stanza forward passes.
+            print(f"[Info] Batch-parsing up to {len(sources)*3} texts with Stanza"
+                  f"{f' (chunks of {batch_size})' if batch_size else ''}...")
+            self._parse_many(list(sources) + list(predictions) + list(references),
+                             batch_size=batch_size)
+        else:
+            print("[Info] Batch parsing disabled — falling back to per-sentence Stanza calls.")
+
         total_tp = total_fp = total_fn = 0
         type_counts: dict[str, dict] = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
         per_sample = []
+
+        fp_samples: list[dict] = []
+        fn_samples: list[dict] = []
+        other_samples: list[dict] = []
+        want_samples = collect_samples > 0
 
         for src, pred, ref in tqdm(zip(sources, predictions, references),
                                     total=len(sources), desc="Scoring", unit="ex"):
             sys_edits_list  = self.annotate(src, pred)
             gold_edits_list = self.annotate(src, ref)
-            sys_edits       = set(_edit_key(e) for e in sys_edits_list)
-            gold_edits      = set(_edit_key(e) for e in gold_edits_list)
-            sys_types  = {_edit_key(e): e.error_types for e in sys_edits_list}
-            gold_types = {_edit_key(e): e.error_types for e in gold_edits_list}
+
+            sys_keys_to_edit  = {_edit_key(e): e for e in sys_edits_list}
+            gold_keys_to_edit = {_edit_key(e): e for e in gold_edits_list}
+            sys_edits  = set(sys_keys_to_edit.keys())
+            gold_edits = set(gold_keys_to_edit.keys())
 
             tp_keys = sys_edits & gold_edits
             fp_keys = sys_edits - gold_edits
@@ -494,13 +604,13 @@ class FinnishERRANT:
             total_fn += len(fn_keys)
 
             for key in tp_keys:
-                for t in gold_types.get(key, (ErrorType.OTHER,)):
+                for t in gold_keys_to_edit[key].error_types or (ErrorType.OTHER,):
                     type_counts[t]["tp"] += 1
             for key in fp_keys:
-                for t in sys_types.get(key, (ErrorType.OTHER,)):
+                for t in sys_keys_to_edit[key].error_types or (ErrorType.OTHER,):
                     type_counts[t]["fp"] += 1
             for key in fn_keys:
-                for t in gold_types.get(key, (ErrorType.OTHER,)):
+                for t in gold_keys_to_edit[key].error_types or (ErrorType.OTHER,):
                     type_counts[t]["fn"] += 1
 
             if verbose:
@@ -510,7 +620,7 @@ class FinnishERRANT:
             if return_per_sample:
                 fp_by_type: dict[str, int] = defaultdict(int)
                 for key in fp_keys:
-                    for t in sys_types.get(key, (ErrorType.OTHER,)):
+                    for t in sys_keys_to_edit[key].error_types or (ErrorType.OTHER,):
                         fp_by_type[t] += 1
                 per_sample.append({
                     "tp": len(tp_keys),
@@ -518,6 +628,36 @@ class FinnishERRANT:
                     "fn": len(fn_keys),
                     "fp_by_type": dict(fp_by_type),
                 })
+
+            if want_samples:
+                need_fp    = len(fp_samples)    < collect_samples
+                need_fn    = len(fn_samples)    < collect_samples
+                need_other = len(other_samples) < collect_samples
+                if need_fp and fp_keys:
+                    fp_edits = [sys_keys_to_edit[k] for k in fp_keys]
+                    fp_samples.append({
+                        'corrupted':  src,
+                        'prediction': pred,
+                        'reference':  ref,
+                        'fp_edits':   [repr(e) for e in fp_edits],
+                    })
+                    if need_other:
+                        other_edits = [e for e in fp_edits if ErrorType.OTHER in e.error_types]
+                        if other_edits:
+                            other_samples.append({
+                                'corrupted':   src,
+                                'prediction':  pred,
+                                'reference':   ref,
+                                'other_edits': [repr(e) for e in other_edits],
+                            })
+                if need_fn and fn_keys:
+                    fn_edits = [gold_keys_to_edit[k] for k in fn_keys]
+                    fn_samples.append({
+                        'corrupted':  src,
+                        'prediction': pred,
+                        'reference':  ref,
+                        'fn_edits':   [repr(e) for e in fn_edits],
+                    })
 
         overall = _compute_f05(total_tp, total_fp, total_fn)
         by_type = {
@@ -527,6 +667,12 @@ class FinnishERRANT:
         result = {**overall, "by_type": by_type}
         if return_per_sample:
             result["per_sample"] = per_sample
+        if want_samples:
+            result["samples"] = {
+                "fp": fp_samples,
+                "fn": fn_samples,
+                "other": other_samples,
+            }
         return result
 
 
@@ -547,7 +693,6 @@ def _edit_key(edit: Edit) -> tuple:
 
 def _is_vowel_harmony_error(a: str, b: str) -> bool:
     """True if the only differences between a and b are vowel harmony pairs (a↔ä, o↔ö, u↔y)."""
-    _HARMONY_PAIRS = {("a", "ä"), ("ä", "a"), ("o", "ö"), ("ö", "o"), ("u", "y"), ("y", "u")}
     if len(a) != len(b):
         return False
     diffs = [(x.lower(), y.lower()) for x, y in zip(a, b) if x.lower() != y.lower()]
@@ -568,12 +713,9 @@ def _is_spelling_variant(a: str, b: str) -> bool:
     """True if Levenshtein edit distance between a and b is ≤ 2."""
     if abs(len(a) - len(b)) > 2:
         return False
-    try:
-        import Levenshtein
-        return Levenshtein.distance(a, b) <= 2
-    except ImportError:
-        # Fallback: naive zip-based check
-        return sum(c1 != c2 for c1, c2 in zip(a, b)) + abs(len(a) - len(b)) <= 2
+    if _Levenshtein is not None:
+        return _Levenshtein.distance(a, b) <= 2
+    return sum(c1 != c2 for c1, c2 in zip(a, b)) + abs(len(a) - len(b)) <= 2
 
 
 def _compute_f05(tp: int, fp: int, fn: int) -> dict:
